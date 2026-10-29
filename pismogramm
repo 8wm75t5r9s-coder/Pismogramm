@@ -1,0 +1,979 @@
+messenger/
+├── app.py
+├── requirements.txt
+├── uploads/
+└── static/
+    └── index.html
+fastapi
+uvicorn[standard]
+sqlalchemy
+python-jose[cryptography]
+pwdlib[argon2]
+python-multipart
+import hashlib
+import os
+import re
+import secrets
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from fastapi import (
+    Depends, FastAPI, File, HTTPException, UploadFile, WebSocket,
+    WebSocketDisconnect
+)
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jose import JWTError, jwt
+from pwdlib import PasswordHash
+from pydantic import BaseModel, Field
+from sqlalchemy import (
+    DateTime, ForeignKey, Integer, String, Text, create_engine, select
+)
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+)
+from starlette.staticfiles import StaticFiles
+
+
+# В production задавайте SECRET_KEY через переменную окружения.
+SECRET_KEY = os.getenv("SECRET_KEY", "")
+if len(SECRET_KEY) < 32:
+    raise RuntimeError("Задайте SECRET_KEY длиной не менее 32 символов")
+
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./messenger.db")
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads")).resolve()
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 МБ
+ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".txt"}
+ACCESS_TOKEN_MINUTES = 15
+REFRESH_TOKEN_DAYS = 14
+
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False}
+    if DATABASE_URL.startswith("sqlite")
+    else {},
+)
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+password_hasher = PasswordHash.recommended()
+bearer = HTTPBearer(auto_error=False)
+
+app = FastAPI(title="Messenger MVP")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    username: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+
+
+class Chat(Base):
+    __tablename__ = "chats"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(10))  # direct / group
+    title: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class ChatMember(Base):
+    __tablename__ = "chat_members"
+
+    chat_id: Mapped[int] = mapped_column(
+        ForeignKey("chats.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+
+
+class Message(Base):
+    __tablename__ = "messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chat_id: Mapped[int] = mapped_column(ForeignKey("chats.id"), index=True)
+    sender_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    text: Mapped[str] = mapped_column(Text, default="")
+    attachment_id: Mapped[str | None] = mapped_column(
+        ForeignKey("attachments.id"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+    __tablename__ = "attachments"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    chat_id: Mapped[int] = mapped_column(ForeignKey("chats.id"))
+    uploader_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    stored_name: Mapped[str] = mapped_column(String(100), unique=True)
+    display_name: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class RefreshSession(Base):
+    __tablename__ = "refresh_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    user_agent: Mapped[str] = mapped_column(String(255), default="")
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+Base.metadata.create_all(engine)
+
+
+def db_session():
+    with SessionLocal() as db:
+        yield db
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def make_access_token(user_id: int) -> str:
+    now = utcnow()
+    payload = {
+        "sub": str(user_id),
+        "type": "access",
+        "iat": now,
+        "exp": now + timedelta(minutes=ACCESS_TOKEN_MINUTES),
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+
+
+def decode_access_token(token: str) -> int | None:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        if payload.get("type") != "access":
+            return None
+        return int(payload["sub"])
+    except (JWTError, KeyError, ValueError):
+        return None
+
+
+def set_refresh_cookie(response, token: str):
+    response.set_cookie(
+        key="refresh_token",
+        value=token,
+        httponly=True,
+        secure=os.getenv("COOKIE_SECURE", "0") == "1",
+        samesite="strict",
+        max_age=REFRESH_TOKEN_DAYS * 24 * 60 * 60,
+        path="/api/auth",
+    )
+
+
+def create_session(db: Session, user: User, user_agent: str) -> str:
+    raw_token = secrets.token_urlsafe(48)
+    db.add(RefreshSession(
+        id=str(uuid.uuid4()),
+        user_id=user.id,
+        token_hash=hash_token(raw_token),
+        user_agent=user_agent[:255],
+        expires_at=utcnow() + timedelta(days=REFRESH_TOKEN_DAYS),
+    ))
+    db.commit()
+    return raw_token
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+    db: Session = Depends(db_session),
+) -> User:
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Требуется вход")
+
+    user_id = decode_access_token(credentials.credentials)
+    user = db.get(User, user_id) if user_id else None
+    if not user:
+        raise HTTPException(status_code=401, detail="Недействительный токен")
+    return user
+
+
+def require_chat_member(db: Session, chat_id: int, user_id: int):
+    member = db.get(ChatMember, (chat_id, user_id))
+    if not member:
+        raise HTTPException(status_code=404, detail="Чат не найден")
+
+
+class AuthData(BaseModel):
+    username: str = Field(min_length=3, max_length=32, pattern=r"^[A-Za-z0-9_]+$")
+    password: str = Field(min_length=10, max_length=128)
+
+
+class DirectChatData(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+
+
+class GroupData(BaseModel):
+    title: str = Field(min_length=1, max_length=100)
+    members: list[str] = Field(default_factory=list, max_length=50)
+
+
+class AddMemberData(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+
+
+class MessageData(BaseModel):
+    text: str = Field(default="", max_length=4000)
+    attachment_id: str | None = None
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return Path("static/index.html").read_text(encoding="utf-8")
+
+
+@app.post("/api/auth/register")
+def register(data: AuthData, response=None, db: Session = Depends(db_session)):
+    # Этот параметр нужен для установки HttpOnly cookie.
+    # FastAPI передаёт Response через отдельную зависимость ниже.
+    raise HTTPException(status_code=500, detail="Используйте /api/auth/register-v2")
+
+
+# Отдельные функции авторизации используют Response явно.
+from fastapi import Response, Request
+
+
+@app.post("/api/auth/register-v2")
+def register_v2(
+    data: AuthData,
+    request: Request,
+    response: Response,
+    db: Session = Depends(db_session),
+):
+    username = data.username.lower()
+    if db.scalar(select(User).where(User.username == username)):
+        raise HTTPException(status_code=409, detail="Имя уже занято")
+
+    user = User(username=username, password_hash=password_hasher.hash(data.password))
+    db.add(user)
+    db.commit()
+      token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    user_agent: Mapped[str] = mapped_column(String(255), default="")
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+Base.metadata.create_all(engine)
+
+
+def db_session():
+    with SessionLocal() as db:
+        yield db
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def make_access_token(user_id: int) -> str:
+    now = utcnow()
+    payload = {
+        "sub": str(user_id),
+        "type": "access",
+        "iat": now,
+        "exp": now + timedelta(minutes=ACCESS_TOKEN_MINUTES),
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+
+
+def decode_access_token(token: str) -> int | None:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        if payload.get("type") != "access":
+            return None
+        return int(payload["sub"])
+    except (JWTError, KeyError, ValueError):
+        return None
+
+
+def set_refresh_cookie(response, token: str):
+    response.set_cookie(
+        key="refresh_token",
+        value=token,
+        httponly=True,
+        secure=os.getenv("COOKIE_SECURE", "0") == "1",
+        samesite="strict",
+        max_age=REFRESH_TOKEN_DAYS * 24 * 60 * 60,
+        path="/api/auth",
+    )
+
+
+def create_session(db: Session, user: User, user_agent: str) -> str:
+    raw_token = secrets.token_urlsafe(48)
+    db.add(RefreshSession(
+        id=str(uuid.uuid4()),
+        user_id=user.id,
+        token_hash=hash_token(raw_token),
+        user_agent=user_agent[:255],
+        expires_at=utcnow() + timedelta(days=REFRESH_TOKEN_DAYS),
+    ))
+    db.commit()
+    return raw_token
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+    db: Session = Depends(db_session),
+) -> User:
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Требуется вход")
+
+    user_id = decode_access_token(credentials.credentials)
+    user = db.get(User, user_id) if user_id else None
+    if not user:
+        raise HTTPException(status_code=401, detail="Недействительный токен")
+    return user
+
+
+def require_chat_member(db: Session, chat_id: int, user_id: int):
+    member = db.get(ChatMember, (chat_id, user_id))
+    if not member:
+        raise HTTPException(status_code=404, detail="Чат не найден")
+
+
+class AuthData(BaseModel):
+    username: str = Field(min_length=3, max_length=32, pattern=r"^[A-Za-z0-9_]+$")
+    password: str = Field(min_length=10, max_length=128)
+
+
+class DirectChatData(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+
+
+class GroupData(BaseModel):
+    title: str = Field(min_length=1, max_length=100)
+    members: list[str] = Field(default_factory=list, max_length=50)
+
+
+class AddMemberData(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+
+
+class MessageData(BaseModel):
+    text: str = Field(default="", max_length=4000)
+    attachment_id: str | None = None
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return Path("static/index.html").read_text(encoding="utf-8")
+
+
+@app.post("/api/auth/register")
+def register(data: AuthData, response=None, db: Session = Depends(db_session)):
+    # Этот параметр нужен для установки HttpOnly cookie.
+    # FastAPI передаёт Response через отдельную зависимость ниже.
+    raise HTTPException(status_code=500, detail="Используйте /api/auth/register-v2")
+
+
+# Отдельные функции авторизации используют Response явно.
+from fastapi import Response, Request
+
+
+@app.post("/api/auth/register-v2")
+def register_v2(
+    data: AuthData,
+    request: Request,
+    response: Response,
+    db: Session = Depends(db_session),
+):
+    username = data.username.lower()
+    if db.scalar(select(User).where(User.username == username)):
+        raise HTTPException(status_code=409, detail="Имя уже занято")
+
+    user = User(username=username, password_hash=password_hasher.hash(data.password))
+    db.add(user)
+    db.commit()
+       refresh = create_session(db, user, request.headers.get("user-agent", ""))
+    set_refresh_cookie(response, refresh)
+    return {"access_token": make_access_token(user.id), "username": user.username}
+
+
+@app.post("/api/auth/login")
+def login(
+    data: AuthData,
+    request: Request,
+    response: Response,
+    db: Session = Depends(db_session),
+):
+    user = db.scalar(select(User).where(User.username == data.username.lower()))
+    if not user or not password_hasher.verify(data.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Неверное имя пользователя или пароль")
+
+    refresh = create_session(db, user, request.headers.get("user-agent", ""))
+    set_refresh_cookie(response, refresh)
+    return {"access_token": make_access_token(user.id), "username": user.username}
+
+
+@app.post("/api/auth/refresh")
+def refresh_token(request: Request, response: Response, db: Session = Depends(db_session)):
+    raw = request.cookies.get("refresh_token")
+    if not raw:
+        raise HTTPException(status_code=401, detail="Нет refresh-токена")
+
+    session = db.scalar(
+        select(RefreshSession).where(RefreshSession.token_hash == hash_token(raw))
+    )
+    if not session or session.expires_at < utcnow():
+        if session:
+            db.delete(session)
+            db.commit()
+        response.delete_cookie("refresh_token", path="/api/auth")
+        raise HTTPException(status_code=401, detail="Сессия истекла")
+
+    user = db.get(User, session.user_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="Пользователь не найден")
+
+    # Ротация: старый refresh-токен становится недействительным.
+    db.delete(session)
+    db.commit()
+    new_refresh = create_session(db, user, request.headers.get("user-agent", ""))
+    set_refresh_cookie(response, new_refresh)
+
+    return {"access_token": make_access_token(user.id), "username": user.username}
+
+
+@app.post("/api/auth/logout")
+def logout(request: Request, response: Response, db: Session = Depends(db_session)):
+    raw = request.cookies.get("refresh_token")
+    if raw:
+        session = db.scalar(
+            select(RefreshSession).where(RefreshSession.token_hash == hash_token(raw))
+        )
+        if session:
+            db.delete(session)
+            db.commit()
+    response.delete_cookie("refresh_token", path="/api/auth")
+    return {"ok": True}
+
+
+@app.get("/api/sessions")
+def list_sessions(user: User = Depends(get_current_user), db: Session = Depends(db_session)):
+    sessions = db.scalars(
+        select(RefreshSession).where(RefreshSession.user_id == user.id)
+    ).all()
+    return [
+        {"id": s.id, "user_agent": s.user_agent, "expires_at": s.expires_at.isoformat()}
+        for s in sessions
+    ]
+
+
+@app.delete("/api/sessions/{session_id}")
+def revoke_session(
+    session_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+):
+    session = db.get(RefreshSession, session_id)
+    if not session or session.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Сессия не найдена")
+    db.delete(session)
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/api/chats")
+def list_chats(user: User = Depends(get_current_user), db: Session = Depends(db_session)):
+    chats = db.scalars(
+        select(Chat)
+        .join(ChatMember, ChatMember.chat_id == Chat.id)
+        .where(ChatMember.user_id == user.id)
+        .order_by(Chat.id.desc())
+    ).all()
+
+    result = []
+    for chat in chats:
+        if chat.kind == "group":
+            title = chat.title or "Группа"
+        else:
+            members = db.scalars(
+                select(User)
+                .join(ChatMember, ChatMember.user_id == User.id)
+                .where(ChatMember.chat_id == chat.id, User.id != user.id)
+            ).all()
+            title = members[0].username if members else user.username
+
+        result.append({"id": chat.id, "kind": chat.kind, "title": title})
+    return result
+
+
+@app.post("/api/chats/direct")
+def create_direct_chat(
+                 if size > MAX_FILE_SIZE:
+                    raise HTTPException(status_code=413, detail="Максимальный размер файла — 20 МБ")
+                output.write(chunk)
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()
+
+    safe_name = re.sub(r"[^\w .()\-]", "_", original_name)[:255] or "file"
+    attachment = Attachment(
+        id=str(uuid.uuid4()),
+        chat_id=chat_id,
+        uploader_id=user.id,
+        stored_name=stored_name,
+        display_name=safe_name,
+    )
+    db.add(attachment)
+    db.commit()
+    return {"id": attachment.id, "name": attachment.display_name}
+
+
+@app.get("/api/files/{attachment_id}")
+def download_file(
+    attachment_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(db_session),
+):
+    attachment = db.get(Attachment, attachment_id)
+    if not attachment:
+        raise HTTPException(status_code=404, detail="Файл не найден")
+    require_chat_member(db, attachment.chat_id, user.id)
+
+    path = UPLOAD_DIR / attachment.stored_name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Файл отсутствует на сервере")
+
+    return FileResponse(
+        path,
+        filename=attachment.display_name,
+        media_type="application/octet-stream",
+    )
+
+
+class ConnectionManager:
+    def __init__(self):
+        self.connections: dict[int, set[WebSocket]] = {}
+
+    async def connect(self, user_id: int, websocket: WebSocket):
+        self.connections.setdefault(user_id, set()).add(websocket)
+
+    def disconnect(self, user_id: int, websocket: WebSocket):
+        self.connections.get(user_id, set()).discard(websocket)
+        if not self.connections.get(user_id):
+            self.connections.pop(user_id, None)
+
+    async def send_to_user(self, user_id: int, payload: dict):
+        for socket in list(self.connections.get(user_id, set())):
+            try:
+                await socket.send_json(payload)
+            except Exception:
+                self.disconnect(user_id, socket)
+
+
+manager = ConnectionManager()
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    user_id = None
+
+    try:
+        # Токен отправляется первым сообщением, а не в URL.
+        auth = await websocket.receive_json()
+        token = auth.get("token") if isinstance(auth, dict) else None
+        user_id = decode_access_token(token) if isinstance(token, str) else None
+        if not user_id:
+            await websocket.close(code=1008)
+            return
+
+        await manager.connect(user_id, websocket)
+        await websocket.send_json({"type": "ready"})
+
+        while True:
+            data = await websocket.receive_json()
+            if not isinstance(data, dict):
+                continue
+
+            chat_id = data.get("chat_id")
+            text = data.get("text", "")
+            attachment_id = data.get("attachment_id")
+
+            if not isinstance(chat_id, int) or not isinstance(text, str):
+                await websocket.send_json({"type": "error", "message": "Неверные данные"})
+                continue
+
+            text = text.strip()
+            if len(text) > 4000 or (not text and not attachment_id):
+                await websocket.send_json({"type": "error", "message": "Пустое или слишком длинное сообщение"})
+                continue
+
+            with SessionLocal() as db:
+                try:
+                    require_chat_member(db, chat_id, user_id)
+                except HTTPException:
+                    await websocket.send_json({"type": "error", "message": "Нет доступа к чату"})
+                    continue
+
+                if attachment_id:
+                    attachment = db.get(Attachment, attachment_id)
+                    if (
+                        not attachment
+                        or attachment.chat_id != chat_id
+                        or attachment.uploader_id != user_id
+                    ):
+                      <!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Мессенджер</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font: 15px Arial, sans-serif;
+      background: #eaf0f5; color: #17212b;
+    }
+    button, input { font: inherit; }
+    button { cursor: pointer; }
+    .auth {
+      max-width: 360px; margin: 12vh auto; padding: 24px;
+      background: white; border-radius: 14px;
+    }
+    .auth input { width: 100%; padding: 11px; margin: 7px 0; }
+    .auth button, .toolbar button, #send { padding: 10px 14px; }
+    #app {
+      display: none; height: 100vh; max-width: 1200px; margin: auto;
+      background: white; box-shadow: 0 0 20px #ccd5dd;
+    }
+    aside { width: 310px; border-right: 1px solid #ddd; display: flex; flex-direction: column; }
+    .toolbar { padding: 12px; border-bottom: 1px solid #ddd; }
+    .toolbar button { margin: 3px 2px; }
+    #chats { overflow: auto; }
+    .chat-item {
+      width: 100%; border: 0; background: white; text-align: left;
+      padding: 15px; border-bottom: 1px solid #eee;
+    }
+    .chat-item:hover, .chat-item.active { background: #edf5fb; }
+    main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+    #chat-title { padding: 17px; border-bottom: 1px solid #ddd; font-weight: bold; }
+    #messages { flex: 1; overflow: auto; padding: 18px; }
+    .message { margin: 10px 0; max-width: 75%; }
+    .bubble { padding: 10px 12px; background: #f0f2f5; border-radius: 12px; overflow-wrap: anywhere; }
+    .mine { margin-left: auto; }
+    .mine .bubble { background: #d8f5d0; }
+    .meta { color: #667; font-size: 12px; margin: 3px 5px; }
+    .composer { display: flex; gap: 8px; padding: 12px; border-top: 1px solid #ddd; }
+    #text { flex: 1; padding: 11px; }
+    #status { padding: 8px 12px; color: #a22; min-height: 32px; }
+    @media (max-width: 650px) {
+      #app { height: 100dvh; }
+      aside { width: 110px; }
+      .toolbar button { padding: 7px 4px; font-size: 12px; }
+      .chat-item { padding: 12px 6px; overflow-wrap: anywhere; }
+    }
+  </style>
+</head>
+<body>
+  <section class="auth" id="auth">
+    <h2>Вход в мессенджер</h2>
+    <input id="username" placeholder="Имя пользователя">
+    <input id="password" type="password" placeholder="Пароль (минимум 10 символов)">
+    <button id="login">Войти</button>
+    <button id="register">Регистрация</button>
+    <div id="auth-error"></div>
+  </section>
+
+  <section id="app">
+    <aside>
+      <div class="toolbar">
+        <button id="new-direct">Личный чат</button>
+        <button id="new-group">Группа</button>
+        <button id="sessions">Сессии</button>
+        <button id="logout">Выйти</button>
+      </div>
+      <div id="chats"></div>
+    </aside>
+    <main>
+      <div id="chat-title">Выберите чат</div>
+      <div id="messages"></div>
+      <div id="status"></div>
+      <form class="composer" id="composer">
+        <input id="file" type="file" accept=".png,.jpg,.jpeg,.gif,.webp,.pdf,.txt">
+        <input id="text" placeholder="Сообщение…" autocomplete="off">
+        <button id="send">Отправить</button>
+      </form>
+    </main>
+  </section>
+
+<script>
+let accessToken = null;
+let socket = null;
+let activeChat = null;
+let chats = [];
+
+const $ = (id) => document.getElementById(id);
+
+async function api(path, options = {}) {
+  const headers = new Headers(options.headers || {});
+  if (accessToken) headers.set("Authorization", `Bearer ${accessToken}`);
+  if (options.body && !(options.body instanceof FormData)) {
+    headers.set("Content-Type", "application/json");
+  }
+
+  let response = await fetch(path, {
+    ...options, headers, credentials: "same-origin"
+  });
+
+  if (response.status === 401 && path !== "/api/auth/refresh") {
+    const refreshed = await fetch("/api/auth/refresh", {
+      method: "POST", credentials: "same-origin"
+    });
+    if (refreshed.ok) {
+      const data = await refreshed.json();
+      accessToken = data.access_token;
+      headers.set("Authorization", `Bearer ${accessToken}`);      response = await fetch(path, {...options, headers, credentials: "same-origin"});
+    }
+  }
+  return response;
+}
+
+function showApp() {
+  $("auth").style.display = "none";
+  $("app").style.display = "flex";
+}
+
+function showAuthError(message) {
+  $("auth-error").textContent = message;
+}
+
+async function authenticate(path) {
+  showAuthError("");
+  const response = await fetch(path, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    credentials: "same-origin",
+    body: JSON.stringify({
+      username: $("username").value,
+      password: $("password").value
+    })
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    showAuthError(data.detail || "Ошибка входа");
+    return;
+  }
+
+  accessToken = data.access_token;
+  showApp();
+  connectSocket();
+  await loadChats();
+}
+
+function connectSocket() {
+  if (socket) socket.close();
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  socket = new WebSocket(`${protocol}//${location.host}/ws`);
+
+  socket.onopen = () => socket.send(JSON.stringify({token: accessToken}));
+  socket.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    if (data.type === "message" && data.message.chat_id === activeChat) {
+      addMessage(data.message);
+    } else if (data.type === "error") {
+      $("status").textContent = data.message;
+    }
+  };
+  socket.onclose = () => {
+    // При необходимости приложение может переподключить WebSocket.
+  };
+}
+
+async function loadChats() {
+  const response = await api("/api/chats");
+  if (!response.ok) return;
+  chats = await response.json();
+
+  const container = $("chats");
+  container.replaceChildren();
+  for (const chat of chats) {
+    const button = document.createElement("button");
+    button.className = "chat-item" + (chat.id === activeChat ? " active" : "");
+    button.textContent = `${chat.kind === "group" ? "👥 " : ""}${chat.title}`;
+    button.onclick = () => openChat(chat);
+    container.appendChild(button);
+  }
+}
+
+async function openChat(chat) {
+  activeChat = chat.id;
+  $("chat-title").textContent = chat.title;
+  $("messages").replaceChildren();
+  $("status").textContent = "";
+  await loadChats();
+
+  const response = await api(`/api/chats/${chat.id}/messages`);
+  if (!response.ok) {
+    $("status").textContent = "Не удалось загрузить переписку";
+    return;
+  }
+  for (const message of await response.json()) addMessage(message);
+}
+
+function addMessage(message) {
+  const container = $("messages");
+  const wrap = document.createElement("div");
+  wrap.className = "message" + (message.sender === $("username").value.toLowerCase() ? " mine" : "");
+
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  meta.textContent = `${message.sender} · ${new Date(message.created_at).toLocaleString()}`;
+
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  bubble.textContent = message.text;
+
+  if (message.attachment) {
+    const fileButton = document.createElement("button");
+    fileButton.textContent = `📎 ${message.attachment.name}`;
+    fileButton.onclick = () => downloadFile(message.attachment.id, message.attachment.name);
+    bubble.append(document.createElement("br"), fileButton);
+  }
+
+  wrap.append(meta, bubble);
+  container.appendChild(wrap);
+  container.scrollTop = container.scrollHeight;
+}
+
+async function downloadFile(id, name) {
+  const response = await api(`/api/files/${encodeURIComponent(id)}`);
+  if (!response.ok) {
+    $("status").textContent = "Не удалось скачать файл";
+    return;
+  }
+  const blob = await response.blob();
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = name;
+  link.click();
+  URL.revokeObjectURL(link.href);
+}
+
+$("login").onclick = () => authenticate("/api/auth/login");
+$("register").onclick = () => authenticate("/api/auth/register-v2");
+
+$("new-direct").onclick = async () => {
+  const username = prompt("Имя пользователя:");
+  if (!username) return;
+    method: "POST", body: JSON.stringify({username})
+  });
+  const data = await response.json();
+  if (!response.ok) return alert(data.detail || "Ошибка");
+  await loadChats();
+  const chat = chats.find(item => item.id === data.id);
+  if (chat) openChat(chat);
+};
+
+$("new-group").onclick = async () => {
+  const title = prompt("Название группы:");
+  if (!title) return;
+  const members = (prompt("Имена участников через запятую:") || "")
+    .split(",").map(x => x.trim()).filter(Boolean);
+
+  const response = await api("/api/chats/group", {
+    method: "POST", body: JSON.stringify({title, members})
+  });
+  const data = await response.json();
+  if (!response.ok) return alert(data.detail || "Ошибка");
+  await loadChats();
+  const chat = chats.find(item => item.id === data.id);
+  if (chat) openChat(chat);
+};
+
+$("sessions").onclick = async () => {
+  const response = await api("/api/sessions");
+  if (!response.ok) return alert("Не удалось получить список сессий");
+  const items = await response.json();
+  alert(items.map(x => `${x.id}\n${x.user_agent}\nИстекает: ${x.expires_at}`).join("\n\n") || "Сессий нет");
+};
+
+$("logout").onclick = async () => {
+  await api("/api/auth/logout", {method: "POST"});
+  if (socket) socket.close();
+  accessToken = null;
+  activeChat = null;
+  $("app").style.display = "none";
+  $("auth").style.display = "block";
+};
+
+$("composer").onsubmit = async (event) => {
+  event.preventDefault();
+  if (!activeChat) {
+    $("status").textContent = "Сначала выберите чат";
+    return;
+  }
+
+  const text = $("text").value.trim();
+  const file = $("file").files[0];
+  if (!text && !file) return;
+
+  let attachment_id = null;
+  if (file) {
+    const form = new FormData();
+    form.append("file", file);
+    const response = await api(`/api/chats/${activeChat}/upload`, {
+      method: "POST", body: form
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      $("status").textContent = data.detail || "Ошибка загрузки";
+      return;
+    }
+    attachment_id = data.id;
+  }
+
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    $("status").textContent = "Нет соединения с сервером";
+    return;
+  }
+
+  socket.send(JSON.stringify({chat_id: activeChat, text, attachment_id}));
+  $("text").value = "";
+  $("file").value = "";
+};
+
+(async function restoreSession() {
+  const response = await fetch("/api/auth/refresh", {
+    method: "POST", credentials: "same-origin"
+  });
+  if (!response.ok) return;
+
+  const data = await response.json();
+  accessToken = data.access_token;
+  $("username").value = data.username;
+  showApp();
+  connectSocket();
+  await loadChats();
+})();
+</script>
+</body>
+</html>
